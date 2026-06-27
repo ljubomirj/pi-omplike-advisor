@@ -273,9 +273,16 @@ export function formatAdvisoryContent(notes: readonly AdvisorNote[], opts?: { st
 // otherwise. It must see what the main model saw, verbatim; clipping fields just
 // hid the part it needed to verify and bred false "didn't persist"/"garbled"
 // advice. (The advisor CAN re-read to verify — system prompt — but that's about
-// its actions, not a license to starve its input.) Cumulative context growth, if
-// it ever overflows, is the advisor agent's own compaction/reset concern (see
-// AdvisorRuntime.reset) — not something to pre-empt by mutilating entries on input.
+// its actions, not a license to starve its input.)
+//
+// Caveat: there is NO input-budget backpressure here, and the advisor does not
+// self-compact (AdvisorRuntime.reset is triggered by the PRIMARY's compaction, not
+// by the advisor's own context filling). On a very long/large session its
+// accumulated context can overflow; today that just fails the review — fail-safe
+// (it drops the batch / goes silent rather than emitting false advice), not a
+// crash. Proper input budgeting (chunking / advisor self-reset on overflow) is a
+// known follow-up; truncation was the wrong tool for it — it corrupted every
+// normal review to avert a rare case.
 function textOf(content: Array<{ type: string; text?: string }>): string {
 	return content.filter((c) => c.type === "text" && typeof c.text === "string").map((c) => c.text as string).join("");
 }
@@ -289,6 +296,17 @@ export function formatTurnDelta(opts: {
 	const parts: string[] = [];
 	if (opts.userPrompt?.trim()) parts.push(`#### User\n\n${opts.userPrompt.trim()}`);
 
+	// Correlate calls → results by toolCallId so an edit's raw args can be suppressed
+	// in favor of the result's diff — but ONLY when that diff actually exists. A failed
+	// edit (no diff) keeps its attempted {oldText,newText} so the advisor can still
+	// diagnose the match failure. Name-agnostic: any call whose result carries a diff.
+	const diffByCallId = new Map<string, string>();
+	for (const tr of opts.toolResults ?? []) {
+		const id = (tr as { toolCallId?: string }).toolCallId;
+		const d = (tr as { details?: { diff?: unknown } }).details?.diff;
+		if (id && typeof d === "string" && d.trim()) diffByCallId.set(id, d);
+	}
+
 	const a = opts.assistant;
 	if (a) {
 		const sub: string[] = [];
@@ -298,14 +316,15 @@ export function formatTurnDelta(opts: {
 			} else if (c.type === "text" && c.text?.trim()) {
 				sub.push(c.text.trim());
 			} else if (c.type === "toolCall") {
-				// Edits are rendered from the post-edit unified diff in their tool RESULT
-				// (below), NOT from the raw {oldText,newText} args. The args are two
-				// unannotated peer blobs: nothing marks which side is on disk. The advisor
-				// reviews AFTER the edit landed (a fresh read shows the NEW side), so peer
-				// blobs make it guess wrong ("didn't persist"). The diff's -/+ markers say
-				// which lines are current. Emit only a header here; the diff follows.
+				// When this call produced a diff (a successful edit), suppress the raw
+				// {oldText,newText} args and let the result's -/+ diff carry the change: the
+				// args are two unannotated peer blobs and the advisor — reviewing AFTER the
+				// edit landed (a fresh read shows the NEW side) — can't tell which is on disk
+				// ("didn't persist"). With NO diff (failed edit, non-edit tool) show the args
+				// verbatim; for a failed edit they're the only evidence of what was attempted.
 				const edits = (c.arguments as { edits?: unknown[] } | undefined)?.edits;
-				if (Array.isArray(edits)) {
+				const hasDiff = diffByCallId.has((c as { id?: string }).id ?? "");
+				if (hasDiff && Array.isArray(edits)) {
 					const p = (c.arguments as { path?: string }).path ?? "?";
 					sub.push(`→ tool \`${c.name}\`(${p}) — ${edits.length} block(s); diff in tool result`);
 				} else {

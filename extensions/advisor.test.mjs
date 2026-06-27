@@ -208,6 +208,27 @@ test("formatTurnDelta: edits render as compact header + result diff (no raw old/
 	assert.ok(!md.includes("Successfully replaced"));
 });
 
+test("formatTurnDelta: a failed edit (no diff) keeps its attempted args for diagnosis", () => {
+	const md = A.formatTurnDelta({
+		assistant: {
+			role: "assistant",
+			content: [
+				{ type: "toolCall", id: "9", name: "edit", arguments: { path: "f.py", edits: [{ oldText: "needle that did not match", newText: "x" }] } },
+			],
+			usage: {},
+			stopReason: "toolUse",
+			timestamp: 1,
+		},
+		// failed edit: error result, NO details.diff
+		toolResults: [
+			{ role: "toolResult", toolCallId: "9", toolName: "edit", content: [{ type: "text", text: "Error: oldText not found" }], isError: true, timestamp: 2 },
+		],
+	});
+	assert.ok(md.includes("needle that did not match"), "attempted oldText must survive when there is no diff");
+	assert.ok(!md.includes("diff in tool result"), "no compact/diff header without a diff");
+	assert.ok(md.includes("`edit` (error)"), "the error is still shown");
+});
+
 test("formatTurnDelta: feeds large content verbatim (no truncation, no markers)", () => {
 	const big = "LINE\n".repeat(5000); // ~25KB, well past every old clamp
 	const md = A.formatTurnDelta({
