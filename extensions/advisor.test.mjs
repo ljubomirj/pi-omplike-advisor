@@ -56,9 +56,8 @@ const ALIAS = {
 const jiti = createJiti(import.meta.url, { moduleCache: false, alias: ALIAS });
 const A = await jiti.import(resolve(HERE, "advisor.ts"));
 
-// formatTurnDelta now returns TextContent[]; join the blocks the way the wire
-// would present them (verbatim) so the existing substring assertions still apply.
-const renderDelta = (o) => A.formatTurnDelta(o).map((b) => b.text).join("\n\n");
+// formatTurnDelta returns a markdown string with verbatim (un-escaped) content.
+const renderDelta = (o) => A.formatTurnDelta(o);
 
 initTheme();
 
@@ -347,19 +346,30 @@ test("formatTurnDelta: marks tool errors", () => {
 	assert.match(md, /#### Tool result: `bash` \(error\)/);
 });
 
-test("formatTurnDelta: empty turn ⇒ no blocks", () => {
-	assert.deepEqual(A.formatTurnDelta({}), []);
+test("formatTurnDelta: empty turn ⇒ empty string", () => {
+	assert.equal(A.formatTurnDelta({}), "");
 });
 
-test("buildReviewMessages: header turn + one user turn per delta, content verbatim", () => {
+test("buildReviewMessages: header turn + one single-block user turn per delta, content verbatim", () => {
 	const d1 = A.formatTurnDelta({
+		userPrompt: "u",
 		assistant: { role: "assistant", content: [{ type: "toolCall", id: "1", name: "bash", arguments: { command: "echo hi\nls" } }], usage: {}, stopReason: "toolUse", timestamp: 1 },
 	});
-	const msgs = A.buildReviewMessages("", [d1]);
-	assert.equal(msgs.length, 2, "header turn + one delta turn");
+	const d2 = A.formatTurnDelta({ assistant: { role: "assistant", content: [{ type: "text", text: "done" }], usage: {}, stopReason: "stop", timestamp: 3 } });
+	const msgs = A.buildReviewMessages("", [d1, d2]);
+	assert.equal(msgs.length, 3, "header turn + two delta turns");
 	assert.ok(msgs.every((m) => m.role === "user"), "all user turns");
+	// Each message carries EXACTLY ONE text block: section separators are explicit in
+	// the content, so model-visibility never depends on provider content-part joining.
+	assert.ok(
+		msgs.every((m) => Array.isArray(m.content) && m.content.length === 1 && m.content[0].type === "text"),
+		"every message is a single text block",
+	);
 	assert.match(msgs[0].content[0].text, /### Session update/);
-	assert.ok(msgs[1].content.some((b) => b.text.includes("echo hi\nls")), "command rides verbatim in its content block");
+	// The explicit \n\n boundary between the #### User and #### Assistant sections must
+	// be present in the block itself (the regression the reviewer flagged).
+	assert.match(msgs[1].content[0].text, /#### User\n\nu\n\n#### Assistant/);
+	assert.ok(msgs[1].content[0].text.includes("echo hi\nls"), "command rides verbatim");
 });
 
 test("AdviseTool: records, dedups, and escalates by severity rank", async () => {

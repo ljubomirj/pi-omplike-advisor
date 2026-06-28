@@ -38,7 +38,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { Agent, type AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Model, TextContent, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Model, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { convertToLlm, createReadOnlyTools } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
@@ -332,17 +332,17 @@ function renderToolArgs(args: Record<string, unknown> | undefined): string {
 	return entries.map(([k, v]) => `${k}:${renderArgValue(v, "  ", 0)}`).join("\n");
 }
 
-// Format one primary turn (optionally preceded by the user prompt) as an array of
-// text content blocks. Returning blocks (not one pre-escaped markdown string) lets
-// each piece ride verbatim as a JSON string on the wire — see buildReviewMessages.
+// Format one primary turn (optionally preceded by the user prompt) as a markdown
+// string with REAL newlines throughout (renderToolArgs keeps arg content verbatim).
+// The sections are joined with explicit "\n\n" here so the boundary never depends on
+// how a provider concatenates content parts — see buildReviewMessages.
 export function formatTurnDelta(opts: {
 	userPrompt?: string;
 	assistant?: AssistantMessage;
 	toolResults?: ToolResultMessage[];
-}): TextContent[] {
-	const blocks: TextContent[] = [];
-	const block = (text: string) => blocks.push({ type: "text", text });
-	if (opts.userPrompt?.trim()) block(`#### User\n\n${opts.userPrompt.trim()}`);
+}): string {
+	const parts: string[] = [];
+	if (opts.userPrompt?.trim()) parts.push(`#### User\n\n${opts.userPrompt.trim()}`);
 
 	// Correlate calls → results by toolCallId so an edit's raw args can be suppressed
 	// in favor of the result's diff — but ONLY when a SUCCESSFUL diff exists. A failed
@@ -382,7 +382,7 @@ export function formatTurnDelta(opts: {
 				}
 			}
 		}
-		if (sub.length) block(`#### Assistant\n\n${sub.join("\n\n")}`);
+		if (sub.length) parts.push(`#### Assistant\n\n${sub.join("\n\n")}`);
 	}
 
 	for (const tr of opts.toolResults ?? []) {
@@ -399,25 +399,26 @@ export function formatTurnDelta(opts: {
 			!tr.isError && typeof diff === "string" && diff.trim()
 				? diff
 				: textOf(tr.content as Array<{ type: string; text?: string }>);
-		block(`#### Tool result: \`${tr.toolName}\`${tr.isError ? " (error)" : ""}\n\n${body || "(no text output)"}`);
+		parts.push(`#### Tool result: \`${tr.toolName}\`${tr.isError ? " (error)" : ""}\n\n${body || "(no text output)"}`);
 	}
-	return blocks;
+	return parts.join("\n\n");
 }
 
 // Assemble a review prompt as a BATCH of user messages: a header/reconfirm turn,
-// then one user turn per primary-turn delta. On OpenAI-family endpoints (e.g.
-// OpenRouter) consecutive user turns stay distinct; on Anthropic-family endpoints
-// they fold into one turn (≈newline-join, per the Anthropic Messages API: "Consecutive
-// user or assistant turns ... will be combined into a single turn"). Either way each
-// delta's content blocks ride verbatim as JSON strings — no \n-escaping, no fences —
-// which is the entire point versus the old JSON.stringify'd markdown blob.
-export function buildReviewMessages(preamble: string, batch: TextContent[][]): UserMessage[] {
+// then one user turn per primary-turn delta. Each message carries exactly ONE text
+// block whose internal section separators ("\n\n") are explicit, so nothing depends
+// on how a provider joins multiple content parts within a message. Between turns:
+// OpenAI-family endpoints (OpenRouter, the default) keep them as distinct turns;
+// Anthropic-family folds consecutive user turns into one (\n-joined, per the Messages
+// API). Each turn starts with a #### / ### header, so it stays legible either way,
+// and arg content rides verbatim (real newlines, no \n-escaping) — the whole point.
+export function buildReviewMessages(preamble: string, batch: string[]): UserMessage[] {
 	const now = Date.now();
 	const messages: UserMessage[] = [
 		{ role: "user", content: [{ type: "text", text: `### Session update\n\n${preamble}`.trimEnd() }], timestamp: now },
 	];
-	for (const deltaBlocks of batch) {
-		if (deltaBlocks.length) messages.push({ role: "user", content: deltaBlocks, timestamp: now });
+	for (const delta of batch) {
+		if (delta.trim()) messages.push({ role: "user", content: [{ type: "text", text: delta }], timestamp: now });
 	}
 	return messages;
 }
@@ -458,7 +459,7 @@ function buildAdvisorAgent(opts: {
  * own context so the next delta replays fresh.
  */
 export class AdvisorRuntime {
-	#pending: TextContent[][] = [];
+	#pending: string[] = [];
 	#held: AdvisorNote[] = [];
 	// Keys re-raised during the in-flight review; drives the post-review prune.
 	#reraised: Set<string> | undefined;
@@ -657,13 +658,10 @@ export class AdvisorRuntime {
 		return { input, output, cost, contextTokens, contextPercent };
 	}
 
-	/** Queue a rendered primary-turn delta (content blocks) for review. Accepts a
-	 *  plain string too (wrapped into a single text block) for convenience/tests. */
-	push(delta: TextContent[] | string): void {
-		const blocks: TextContent[] =
-			typeof delta === "string" ? (delta.trim() ? [{ type: "text", text: delta }] : []) : delta;
-		if (this.disposed || blocks.length === 0) return;
-		this.#pending.push(blocks);
+	/** Queue a rendered primary-turn delta (markdown string) for review. */
+	push(deltaText: string): void {
+		if (this.disposed || !deltaText.trim()) return;
+		this.#pending.push(deltaText);
 		this.#backlog++;
 		void this.#drain();
 	}
