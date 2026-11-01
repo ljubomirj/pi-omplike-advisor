@@ -447,6 +447,41 @@ export function buildReviewMessages(preamble: string, batch: string[]): UserMess
 
 // ---- build the persistent advisor Agent ----
 
+/**
+ * OpenCode Go / Zen require `x-opencode-session` on every request ("cannot be
+ * routed efficiently" without it). pi's coding-agent layer adds it per turn from
+ * the session id (`core/provider-attribution.js`), but the advisor's nested
+ * `Agent` calls pi-ai's `streamSimple` directly with no session id — so every
+ * review came back `400 MissingSessionID` and the advisor silently produced
+ * nothing. One stable id per process is all the relay needs; `model.headers` is
+ * merged verbatim into the request (`api/openai-completions.js`).
+ */
+const ADVISOR_OPENCODE_SESSION = `pi-advisor-${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
+
+export function withOpenCodeSessionHeaders<T extends Model<any>>(model: T): T {
+	const provider = String((model as any).provider ?? "");
+	const baseUrl = String((model as any).baseUrl ?? "");
+	if (!/opencode/i.test(provider) && !/opencode\.ai/i.test(baseUrl)) return model;
+	const existing = (model as any).headers ?? {};
+	// HTTP header names are case-insensitive. A single non-empty session id is all the
+	// relay needs and is left untouched; otherwise (absent, empty, or several case
+	// variants) exactly one canonical lowercase header is written, carrying the first
+	// usable existing value so a real id is never replaced by a generated one.
+	const keys = Object.keys(existing).filter((key) => key.toLowerCase() === "x-opencode-session");
+	if (keys.length === 1 && String(existing[keys[0]] ?? "").length > 0) return model;
+	const usable = keys.map((key) => String(existing[key] ?? "")).find((value) => value.length > 0);
+	const headers: Record<string, unknown> = { ...existing };
+	for (const key of keys) delete headers[key];
+	return {
+		...model,
+		headers: {
+			...headers,
+			"x-opencode-session": usable ?? ADVISOR_OPENCODE_SESSION,
+			"x-opencode-client": "pi-advisor",
+		},
+	} as T;
+}
+
 function buildAdvisorAgent(opts: {
 	cwd: string;
 	model: Model<any>;
@@ -456,11 +491,14 @@ function buildAdvisorAgent(opts: {
 	adviseTool: AdviseTool;
 }): Agent {
 	const readOnly = createReadOnlyTools(opts.cwd);
-	const thinkingLevel = opts.model.reasoning ? (opts.thinkingLevel as any) : ("off" as any);
+	// OpenCode Go/Zen reject requests without the session header; the advisor's
+	// nested agent bypasses the coding-agent layer that normally adds it.
+	const model = withOpenCodeSessionHeaders(opts.model);
+	const thinkingLevel = model.reasoning ? (opts.thinkingLevel as any) : ("off" as any);
 	return new Agent({
 		initialState: {
 			systemPrompt: opts.systemPrompt,
-			model: opts.model,
+			model,
 			thinkingLevel,
 			tools: [opts.adviseTool, ...readOnly] as any,
 		},

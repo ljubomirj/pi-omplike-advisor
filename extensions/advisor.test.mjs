@@ -464,6 +464,76 @@ test("AdviseTool: markDelivered records dedup at the real delivery point", async
 	assert.equal(calls.length, 1);
 });
 
+test("withOpenCodeSessionHeaders: opencode models get a stable session id + client tag", () => {
+	const model = { provider: "opencode-go-equal", baseUrl: "https://opencode.ai/zen/v1", headers: { "x-existing": "1" } };
+	const out = A.withOpenCodeSessionHeaders(model);
+	assert.equal(typeof out.headers["x-opencode-session"], "string");
+	assert.ok(out.headers["x-opencode-session"].length >= 16, "id is not empty");
+	assert.equal(out.headers["x-opencode-client"], "pi-advisor");
+	assert.equal(out.headers["x-existing"], "1", "keeps unrelated headers");
+	assert.notEqual(out, model, "returns a copy");
+	assert.equal(model.headers["x-opencode-session"], undefined, "input model not mutated");
+	assert.equal(
+		A.withOpenCodeSessionHeaders(model).headers["x-opencode-session"],
+		out.headers["x-opencode-session"],
+		"same id for every review in the process",
+	);
+});
+
+test("withOpenCodeSessionHeaders: matches by base URL, leaves other providers untouched", () => {
+	const byUrl = A.withOpenCodeSessionHeaders({ provider: "custom", baseUrl: "https://opencode.ai/zen/v1" });
+	assert.equal(typeof byUrl.headers["x-opencode-session"], "string", "opencode.ai base URL is enough");
+	const plain = { provider: "openai", baseUrl: "https://api.openai.com/v1" };
+	assert.equal(A.withOpenCodeSessionHeaders(plain), plain, "non-opencode model returned as-is");
+});
+
+test("withOpenCodeSessionHeaders: an empty session header is filled, not kept", () => {
+	for (const key of ["x-opencode-session", "X-OpenCode-Session"]) {
+		const out = A.withOpenCodeSessionHeaders({ provider: "opencode-go", headers: { [key]: "" } });
+		const values = Object.entries(out.headers)
+			.filter(([k]) => k.toLowerCase() === "x-opencode-session")
+			.map(([, v]) => v);
+		assert.equal(values.length, 1, `exactly one session header alongside empty ${key}`);
+		assert.ok(String(values[0]).length >= 16, `generated id replaces empty ${key}`);
+	}
+});
+
+test("withOpenCodeSessionHeaders: several case variants collapse to one usable header", () => {
+	const empty = A.withOpenCodeSessionHeaders({
+		provider: "opencode-go",
+		headers: { "X-OpenCode-Session": "", "x-opencode-session": "good-id" },
+	});
+	assert.deepEqual(
+		Object.entries(empty.headers)
+			.filter(([k]) => k.toLowerCase() === "x-opencode-session")
+			.map(([, v]) => v),
+		["good-id"],
+		"the usable id survives and the empty variant is gone",
+	);
+	const both = A.withOpenCodeSessionHeaders({
+		provider: "opencode-go",
+		headers: { "X-OpenCode-Session": "a", "x-opencode-session": "b" },
+	});
+	assert.equal(
+		Object.keys(both.headers).filter((k) => k.toLowerCase() === "x-opencode-session").length,
+		1,
+		"two variants become one header, not two",
+	);
+});
+
+test("withOpenCodeSessionHeaders: never duplicates an existing id, whatever the case", () => {
+	for (const key of ["x-opencode-session", "X-OpenCode-Session"]) {
+		const preset = { provider: "opencode-go", headers: { [key]: "keep-me" } };
+		const out = A.withOpenCodeSessionHeaders(preset);
+		assert.equal(out, preset, `left unchanged when ${key} is present`);
+		assert.equal(
+			Object.keys(out.headers).filter((k) => k.toLowerCase() === "x-opencode-session").length,
+			1,
+			`no second session header alongside ${key}`,
+		);
+	}
+});
+
 // ===========================================================================
 // 1b. runtime mechanics (offline, stub agent) — always-hold + catch-up block
 //
